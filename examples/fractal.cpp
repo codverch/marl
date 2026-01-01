@@ -19,11 +19,16 @@
 #include "marl/scheduler.h"
 #include "marl/thread.h"
 #include "marl/waitgroup.h"
+#include <iostream>
+#include <mutex>
 
 #include <fstream>
 
 #include <cmath>
 #include <stdint.h>
+
+std::mutex print_mutex;
+std::set<std::thread::id> unique_threads;
 
 // A color formed from a red, green and blue component.
 template <typename T>
@@ -173,6 +178,14 @@ int main() {
       // This is used to indicate that the task is done.
       defer(wg.done());
 
+      // DEEPANJALI
+
+      {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        unique_threads.insert(std::this_thread::get_id());
+      }
+
+
       for (uint32_t x = 0; x < imageWidth; x++) {
         // Calculate the fractal pixel color.
         Color<float> color = {};
@@ -199,6 +212,15 @@ int main() {
 
   // Wait until all image lines have been calculated.
   wg.wait();
+
+  std::cout << "\n=== Thread Usage Summary ===\n";
+  std::cout << "Total unique threads used: " << unique_threads.size() << "\n";
+  std::cout << "Thread IDs:\n";
+  for (const auto& tid : unique_threads) {
+    std::cout << "  " << tid << "\n";
+  }
+  std::cout << "===========================\n\n";
+
 
   // Write the image to "fractal.bmp".
   if (!writeBMP(pixels, imageWidth, imageHeight, "fractal.bmp")) {

@@ -112,7 +112,7 @@ void do_computation(int complexity, uint64_t& computation_time_ns) {
     
     // Array size matches typical L1 data cache (32-64KB)
     // This ensures we fill the cache and cause evictions
-    const int ARRAY_SIZE = 1024 * 64;  // 64KB = 64K integers
+    const int ARRAY_SIZE = 1024 * 64;  // int = 4 bytes, 64K ints = 256KB
     static thread_local std::vector<int> data(ARRAY_SIZE);
     
     // Thread-local random number generator for unpredictable access patterns

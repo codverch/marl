@@ -7,12 +7,216 @@
 #include <atomic>
 #include <fstream>
 #include <iomanip>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+#include <sys/ioctl.h>
+#include <cstring>
 
 // MARL Headers
 #include "marl/defer.h"
 #include "marl/event.h"
 #include "marl/scheduler.h"
 #include "marl/waitgroup.h"
+
+// ============================================================================
+// Perf Event Wrapper: Hardware Performance Counter Collection
+// ============================================================================
+/**
+ * RAII wrapper for Linux perf_event_open syscall.
+ * Collects hardware performance counters during benchmark execution.
+ */
+class PerfEvent {
+private:
+    int fd;
+    std::string name;
+    
+    static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
+                               int cpu, int group_fd, unsigned long flags) {
+        return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
+    }
+    
+public:
+    PerfEvent(uint32_t type, uint64_t config, const std::string& event_name) 
+        : fd(-1), name(event_name) {
+        struct perf_event_attr pe;
+        memset(&pe, 0, sizeof(struct perf_event_attr));
+        pe.type = type;
+        pe.size = sizeof(struct perf_event_attr);
+        pe.config = config;
+        pe.disabled = 1;
+        pe.exclude_kernel = 0;  // Include kernel events
+        pe.exclude_hv = 1;      // Exclude hypervisor
+        pe.inherit = 1;         // Inherit to child threads
+        
+        fd = perf_event_open(&pe, 0, -1, -1, 0);
+        if (fd == -1) {
+            std::cerr << "Warning: Failed to open perf event " << name 
+                     << ": " << strerror(errno) << std::endl;
+        }
+    }
+    
+    ~PerfEvent() {
+        if (fd != -1) {
+            close(fd);
+        }
+    }
+    
+    void reset() {
+        if (fd != -1) {
+            ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+        }
+    }
+    
+    void enable() {
+        if (fd != -1) {
+            ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+        }
+    }
+    
+    void disable() {
+        if (fd != -1) {
+            ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+        }
+    }
+    
+    uint64_t read() {
+        if (fd == -1) {
+            return 0;
+        }
+        uint64_t count = 0;
+        ssize_t bytes = ::read(fd, &count, sizeof(uint64_t));
+        if (bytes != sizeof(uint64_t)) {
+            return 0;
+        }
+        return count;
+    }
+    
+    bool is_valid() const {
+        return fd != -1;
+    }
+    
+    std::string get_name() const {
+        return name;
+    }
+};
+
+// ============================================================================
+// Perf Metrics: Aggregated Hardware Performance Counter Results
+// ============================================================================
+/**
+ * Stores hardware performance counter results for a single benchmark run.
+ */
+struct PerfMetrics {
+    uint64_t cpu_cycles{0};
+    uint64_t instructions{0};
+    uint64_t cache_references{0};
+    uint64_t cache_misses{0};
+    uint64_t branch_instructions{0};
+    uint64_t branch_misses{0};
+    uint64_t context_switches{0};
+    uint64_t page_faults{0};
+    
+    // Derived metrics
+    double ipc() const {  // Instructions Per Cycle
+        return (cpu_cycles > 0) ? static_cast<double>(instructions) / cpu_cycles : 0.0;
+    }
+    
+    double cache_miss_rate() const {
+        return (cache_references > 0) 
+            ? static_cast<double>(cache_misses) / cache_references * 100.0 
+            : 0.0;
+    }
+    
+    double branch_miss_rate() const {
+        return (branch_instructions > 0) 
+            ? static_cast<double>(branch_misses) / branch_instructions * 100.0 
+            : 0.0;
+    }
+};
+
+// ============================================================================
+// Perf Counter Manager: Manages Multiple Performance Counters
+// ============================================================================
+/**
+ * Manages a set of performance counters for the benchmark.
+ */
+class PerfCounterManager {
+private:
+    std::vector<std::unique_ptr<PerfEvent>> events;
+    
+public:
+    PerfCounterManager() {
+        // Hardware counters
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "cpu_cycles"));
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, "instructions"));
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES, "cache_references"));
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES, "cache_misses"));
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, "branch_instructions"));
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES, "branch_misses"));
+        
+        // Software counters
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES, "context_switches"));
+        events.push_back(std::make_unique<PerfEvent>(
+            PERF_TYPE_SOFTWARE, PERF_COUNT_SW_PAGE_FAULTS, "page_faults"));
+    }
+    
+    void reset_all() {
+        for (auto& event : events) {
+            event->reset();
+        }
+    }
+    
+    void enable_all() {
+        for (auto& event : events) {
+            event->enable();
+        }
+    }
+    
+    void disable_all() {
+        for (auto& event : events) {
+            event->disable();
+        }
+    }
+    
+    PerfMetrics read_all() {
+        PerfMetrics metrics;
+        
+        for (auto& event : events) {
+            if (!event->is_valid()) continue;
+            
+            uint64_t value = event->read();
+            std::string name = event->get_name();
+            
+            if (name == "cpu_cycles") metrics.cpu_cycles = value;
+            else if (name == "instructions") metrics.instructions = value;
+            else if (name == "cache_references") metrics.cache_references = value;
+            else if (name == "cache_misses") metrics.cache_misses = value;
+            else if (name == "branch_instructions") metrics.branch_instructions = value;
+            else if (name == "branch_misses") metrics.branch_misses = value;
+            else if (name == "context_switches") metrics.context_switches = value;
+            else if (name == "page_faults") metrics.page_faults = value;
+        }
+        
+        return metrics;
+    }
+    
+    void print_status() {
+        std::cout << "Perf counters initialized:\n";
+        for (auto& event : events) {
+            std::cout << "  " << event->get_name() << ": " 
+                     << (event->is_valid() ? "OK" : "FAILED") << "\n";
+        }
+    }
+};
 
 // ============================================================================
 // MicrobenchmarkMetrics: Tracks Performance Metrics
@@ -32,6 +236,9 @@ struct MicrobenchmarkMetrics {
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point end_time;
     
+    // Hardware performance counters
+    PerfMetrics perf_metrics;
+    
     // Enable move semantics for struct with atomic members
     MicrobenchmarkMetrics() = default;
     MicrobenchmarkMetrics(MicrobenchmarkMetrics&& other) noexcept
@@ -40,7 +247,8 @@ struct MicrobenchmarkMetrics {
           total_computation_time_ns(other.total_computation_time_ns.load()),
           total_blocking_time_ns(other.total_blocking_time_ns.load()),
           start_time(other.start_time),
-          end_time(other.end_time) {}
+          end_time(other.end_time),
+          perf_metrics(other.perf_metrics) {}
     
     MicrobenchmarkMetrics& operator=(MicrobenchmarkMetrics&& other) noexcept {
         total_fiber_switches.store(other.total_fiber_switches.load());
@@ -49,6 +257,7 @@ struct MicrobenchmarkMetrics {
         total_blocking_time_ns.store(other.total_blocking_time_ns.load());
         start_time = other.start_time;
         end_time = other.end_time;
+        perf_metrics = other.perf_metrics;
         return *this;
     }
     
@@ -110,10 +319,24 @@ struct MicrobenchmarkMetrics {
 void do_computation(int complexity, uint64_t& computation_time_ns) {
     auto start = std::chrono::steady_clock::now();
     
-    // Array size matches typical L1 data cache (32-64KB)
-    // This ensures we fill the cache and cause evictions
-    const int ARRAY_SIZE = 1024 * 64;  // int = 4 bytes, 64K ints = 256KB
-    static thread_local std::vector<int> data(ARRAY_SIZE);
+    // CRITICAL: Working set MUST exceed L2 cache to show cache pollution effects
+    // Xeon Silver 4114: L1d=32KB, L2=1MB, L3=13.75MB per socket
+    // We use 3MB per fiber to ensure:
+    // 1. Doesn't fit in L2 (forces L3 usage)
+    // 2. Multiple fibers compete for L3 space (oversubscription shows pollution)
+    // 3. Fiber switches cause cache line evictions
+    const int ARRAY_SIZE = 1024 * 768;  // 768K ints = 3 MB (exceeds L2!)
+    
+    // Initialize with random data (not zeros!) to avoid predictable patterns
+    static thread_local std::vector<int> data = []() {
+        std::vector<int> v(ARRAY_SIZE);
+        std::mt19937 init_gen(std::random_device{}());
+        std::uniform_int_distribution<int> init_dis(1, 1000000);
+        for (auto& val : v) {
+            val = init_dis(init_gen);
+        }
+        return v;
+    }();
     
     // Thread-local random number generator for unpredictable access patterns
     static thread_local std::mt19937 gen(std::random_device{}());
@@ -122,7 +345,7 @@ void do_computation(int complexity, uint64_t& computation_time_ns) {
     // Volatile prevents compiler from optimizing away the computation
     volatile int result = 0;
     
-    // Main computation loop with cache and branch predictor pollution
+    // Main computation loop with AGGRESSIVE cache and branch predictor pollution
     for (int i = 0; i < complexity; ++i) {
         // Random index access (destroys spatial locality)
         int idx = dis(gen);
@@ -142,9 +365,18 @@ void do_computation(int complexity, uint64_t& computation_time_ns) {
         // Accumulate result to prevent dead code elimination
         result += data[idx];
         
-        // Additional random access for more cache pressure
+        // Additional random accesses for MORE cache pressure
+        // This creates a random walk through the array
         int next_idx = (idx + data[idx]) % ARRAY_SIZE;
         result ^= data[next_idx];
+        
+        // Third random access - really thrash the cache!
+        int third_idx = (next_idx + data[next_idx]) % ARRAY_SIZE;
+        data[third_idx] += result & 0xFF;
+        
+        // Fourth access - ensure we're hitting many cache lines
+        int fourth_idx = (idx + i * 997) % ARRAY_SIZE;  // Prime number for spread
+        result += data[fourth_idx];
     }
     
     auto end = std::chrono::steady_clock::now();
@@ -237,7 +469,7 @@ void run_task(int task_id, int num_iterations, double io_probability,
     
     // Per-task random number generator (seeded with task_id for reproducibility)
     std::mt19937 gen(task_id);
-    std::uniform_int_distribution<> comp_dis(1000, 5000);   // Computation complexity
+    std::uniform_int_distribution<> comp_dis(2000, 8000);   // Increased for 3MB working set
     std::uniform_int_distribution<> block_dis(10, 100);     // Blocking duration (microseconds)
     std::uniform_real_distribution<> prob_dis(0.0, 1.0);    // Probability distribution
     
@@ -277,7 +509,7 @@ void run_task(int task_id, int num_iterations, double io_probability,
  * 1. Configures MARL scheduler with fixed worker threads
  * 2. Spawns the requested number of tasks (fibers)
  * 3. Waits for all tasks to complete
- * 4. Returns aggregated metrics
+ * 4. Returns aggregated metrics (including perf counters)
  * 
  * The key insight: We keep worker threads (OS threads) constant while varying
  * the number of fibers. This creates oversubscription when num_fibers >> num_workers.
@@ -294,14 +526,26 @@ MicrobenchmarkMetrics run_microbenchmark(int num_fibers,
                                           int num_worker_threads) {
     MicrobenchmarkMetrics metrics;
     
+    // Initialize perf counters
+    PerfCounterManager perf_manager;
+    
     // Configure MARL scheduler
     marl::Scheduler::Config config;
     config.setWorkerThreadCount(num_worker_threads);
+    
+    // Reduce fiber stack size to allow more concurrent fibers
+    // Default is 1MB, we use 128KB which is sufficient for our workload
+    // This allows ~8x more fibers before hitting memory limits
+    config.setFiberStackSize(128 * 1024);  // 128 KB per fiber
     
     // Create scheduler instance
     auto scheduler = std::make_unique<marl::Scheduler>(config);
     scheduler->bind();   // Bind scheduler to current thread
     defer(scheduler->unbind());  // Ensure unbind happens at scope exit
+    
+    // Reset and enable perf counters
+    perf_manager.reset_all();
+    perf_manager.enable_all();
     
     // Record microbenchmark start time
     metrics.start_time = std::chrono::steady_clock::now();
@@ -327,6 +571,10 @@ MicrobenchmarkMetrics run_microbenchmark(int num_fibers,
     // Record microbenchmark end time
     metrics.end_time = std::chrono::steady_clock::now();
     
+    // Disable and read perf counters
+    perf_manager.disable_all();
+    metrics.perf_metrics = perf_manager.read_all();
+    
     return metrics;
 }
 
@@ -346,6 +594,19 @@ struct MicrobenchmarkResult {
     double total_time_ms;               // Total microbenchmark duration
     double oversubscription_ratio;      // num_fibers / num_workers
     double io_probability;              // I/O operation probability
+    
+    // Perf metrics
+    uint64_t cpu_cycles;
+    uint64_t instructions;
+    double ipc;
+    uint64_t cache_references;
+    uint64_t cache_misses;
+    double cache_miss_rate;
+    uint64_t branch_instructions;
+    uint64_t branch_misses;
+    double branch_miss_rate;
+    uint64_t context_switches;
+    uint64_t page_faults;
 };
 
 // ============================================================================
@@ -354,12 +615,7 @@ struct MicrobenchmarkResult {
 /**
  * Writes microbenchmark results to CSV file for analysis and visualization.
  * 
- * Output format:
- * num_threads,num_workers,oversubscription_ratio,throughput,thread_switches,
- * avg_computation_time_ms,total_time_ms,io_probability
- * 
- * Note: Column names use "num_threads" and "thread_switches" for compatibility
- * with existing visualization scripts, but these represent fibers and fiber switches.
+ * Output format includes both application metrics and hardware performance counters.
  * 
  * @param results Vector of microbenchmark results
  * @param filename Output CSV filename
@@ -368,11 +624,11 @@ void write_results_csv(const std::vector<MicrobenchmarkResult>& results,
                        const std::string& filename) {
     std::ofstream file(filename);
     
-    // Write CSV header (using legacy names for compatibility)
     file << "num_threads,num_workers,oversubscription_ratio,throughput,thread_switches,"
-         << "avg_computation_time_ms,total_time_ms,io_probability\n";
+         << "avg_computation_time_ms,total_time_ms,io_probability,"
+         << "cpu_cycles,instructions,ipc,cache_references,cache_misses,cache_miss_rate,"
+         << "branch_instructions,branch_misses,branch_miss_rate,context_switches,page_faults\n";
     
-    // Write data rows
     for (const auto& r : results) {
         file << r.num_fibers << ","
              << r.num_workers << ","
@@ -381,10 +637,43 @@ void write_results_csv(const std::vector<MicrobenchmarkResult>& results,
              << r.fiber_switches << ","
              << std::fixed << std::setprecision(4) << r.avg_computation_time_ms << ","
              << std::fixed << std::setprecision(2) << r.total_time_ms << ","
-             << std::fixed << std::setprecision(2) << r.io_probability << "\n";
+             << std::fixed << std::setprecision(2) << r.io_probability << ","
+             << r.cpu_cycles << ","
+             << r.instructions << ","
+             << std::fixed << std::setprecision(3) << r.ipc << ","
+             << r.cache_references << ","
+             << r.cache_misses << ","
+             << std::fixed << std::setprecision(2) << r.cache_miss_rate << ","
+             << r.branch_instructions << ","
+             << r.branch_misses << ","
+             << std::fixed << std::setprecision(2) << r.branch_miss_rate << ","
+             << r.context_switches << ","
+             << r.page_faults << "\n";
     }
     
     std::cout << "Results written to " << filename << std::endl;
+}
+
+void print_detailed_results(const MicrobenchmarkResult& result) {
+    std::cout << "  Throughput: " << std::fixed << std::setprecision(2) 
+              << result.throughput << " tasks/sec\n";
+    std::cout << "  Fiber switches: " << result.fiber_switches << "\n";
+    std::cout << "  Oversubscription: " << std::fixed << std::setprecision(2) 
+              << result.oversubscription_ratio << "x\n";
+    std::cout << "  Total time: " << result.total_time_ms << " ms\n";
+    
+    std::cout << "\n  Hardware Perf Counters:\n";
+    std::cout << "    CPU cycles: " << result.cpu_cycles << "\n";
+    std::cout << "    Instructions: " << result.instructions << "\n";
+    std::cout << "    IPC: " << std::fixed << std::setprecision(3) << result.ipc << "\n";
+    std::cout << "    Cache references: " << result.cache_references << "\n";
+    std::cout << "    Cache misses: " << result.cache_misses 
+              << " (" << std::fixed << std::setprecision(2) << result.cache_miss_rate << "%)\n";
+    std::cout << "    Branch instructions: " << result.branch_instructions << "\n";
+    std::cout << "    Branch misses: " << result.branch_misses 
+              << " (" << std::fixed << std::setprecision(2) << result.branch_miss_rate << "%)\n";
+    std::cout << "    Context switches: " << result.context_switches << "\n";
+    std::cout << "    Page faults: " << result.page_faults << "\n\n";
 }
 
 // ============================================================================
@@ -400,14 +689,17 @@ void write_results_csv(const std::vector<MicrobenchmarkResult>& results,
  * - Performance peaks around hardware concurrency (1x)
  * - Degradation begins at 2-4x oversubscription
  * - Significant loss at 8x+ oversubscription
+ * - Hardware counters show increased cache misses and branch mispredictions
  * - Proves that oversubscription hurts performance (especially with microsecond I/O)
  */
 int main(int argc, char** argv) {
-    std::cout << "================================================\n";
-    std::cout << "Fiber Oversubscription Microbenchmark (MARL)\n";
+    std::cout << "========================================================\n";
+    std::cout << "Fiber Oversubscription Microbenchmark (MARL + Perf)\n";
+    std::cout << "Cache-Aware Design for Intel Xeon Silver 4114\n";
+    std::cout << "Working Set: 3 MB/fiber (exceeds L2, competes for L3)\n";
     std::cout << "NVMe/Accelerator I/O Profile (microseconds)\n";
-    std::cout << "User-space fiber switches (no kernel overhead)\n";
-    std::cout << "================================================\n\n";
+    std::cout << "User-space fiber switches + Hardware perf counters\n";
+    std::cout << "========================================================\n\n";
     
     // ========================================================================
     // Configuration
@@ -433,10 +725,17 @@ int main(int argc, char** argv) {
     std::cout << "I/O probability: " << std::fixed << std::setprecision(1) 
               << (io_probability * 100) << "%\n\n";
     
+    // Check perf availability
+    std::cout << "Checking perf event support...\n";
+    PerfCounterManager test_perf;
+    test_perf.print_status();
+    std::cout << "\n";
+    
     // ========================================================================
     // Fiber Count Scenarios
     // ========================================================================
     // Test various oversubscription levels to demonstrate performance impact
+    // Note: Very high fiber counts (>32x) may cause memory exhaustion
     std::vector<int> fiber_counts = {
         NUM_WORKER_THREADS / 2,       // 0.5x - Undersubscribed
         NUM_WORKER_THREADS,           // 1.0x - Balanced (optimal)
@@ -444,10 +743,14 @@ int main(int argc, char** argv) {
         NUM_WORKER_THREADS * 4,       // 4.0x - High oversubscription
         NUM_WORKER_THREADS * 8,       // 8.0x - Very high oversubscription
         NUM_WORKER_THREADS * 16,      // 16.0x - Extreme oversubscription
-        NUM_WORKER_THREADS * 32,      // 32.0x - Datacenter-like scenario
-        500,                          // Fixed large count
-        1000                          // Fixed very large count
+        // NUM_WORKER_THREADS * 32       // 32.0x - Maximum safe oversubscription
     };
+    
+    // Memory estimate for max configuration
+    int max_fibers = NUM_WORKER_THREADS * 32;
+    double max_memory_mb = (max_fibers * 3.0) + (max_fibers * 0.1);  // 3MB data + ~100KB stack per fiber
+    std::cout << "Maximum expected memory usage: ~" << std::fixed << std::setprecision(1) 
+              << max_memory_mb << " MB (" << max_fibers << " fibers)\n\n";
     
     std::vector<MicrobenchmarkResult> results;
     
@@ -457,9 +760,22 @@ int main(int argc, char** argv) {
     for (int num_fibers : fiber_counts) {
         std::cout << "Running microbenchmark with " << num_fibers << " fibers...\n";
         
-        // Run microbenchmark and collect metrics
-        auto metrics = run_microbenchmark(num_fibers, ITERATIONS_PER_FIBER, 
-                                          io_probability, NUM_WORKER_THREADS);
+        // Run microbenchmark and collect metrics with error handling
+        MicrobenchmarkMetrics metrics;
+        try {
+            metrics = run_microbenchmark(num_fibers, ITERATIONS_PER_FIBER, 
+                                              io_probability, NUM_WORKER_THREADS);
+        } catch (const std::exception& e) {
+            std::cerr << "Error running benchmark with " << num_fibers 
+                     << " fibers: " << e.what() << "\n";
+            std::cerr << "Skipping this configuration and continuing...\n\n";
+            continue;
+        } catch (...) {
+            std::cerr << "Unknown error running benchmark with " << num_fibers 
+                     << " fibers\n";
+            std::cerr << "Skipping this configuration and continuing...\n\n";
+            continue;
+        }
         
         // Package results
         MicrobenchmarkResult result;
@@ -473,26 +789,33 @@ int main(int argc, char** argv) {
         result.oversubscription_ratio = static_cast<double>(num_fibers) / NUM_WORKER_THREADS;
         result.io_probability = io_probability;
         
+        // Add perf metrics
+        result.cpu_cycles = metrics.perf_metrics.cpu_cycles;
+        result.instructions = metrics.perf_metrics.instructions;
+        result.ipc = metrics.perf_metrics.ipc();
+        result.cache_references = metrics.perf_metrics.cache_references;
+        result.cache_misses = metrics.perf_metrics.cache_misses;
+        result.cache_miss_rate = metrics.perf_metrics.cache_miss_rate();
+        result.branch_instructions = metrics.perf_metrics.branch_instructions;
+        result.branch_misses = metrics.perf_metrics.branch_misses;
+        result.branch_miss_rate = metrics.perf_metrics.branch_miss_rate();
+        result.context_switches = metrics.perf_metrics.context_switches;
+        result.page_faults = metrics.perf_metrics.page_faults;
+        
         results.push_back(result);
         
-        // Print summary
-        std::cout << "  Throughput: " << std::fixed << std::setprecision(2) 
-                  << result.throughput << " tasks/sec\n";
-        std::cout << "  Fiber switches: " << result.fiber_switches << "\n";
-        std::cout << "  Oversubscription: " << std::fixed << std::setprecision(2) 
-                  << result.oversubscription_ratio << "x\n";
-        std::cout << "  Total time: " << result.total_time_ms << " ms\n\n";
+        print_detailed_results(result);
+        
+        write_results_csv(results, "benchmark_results_with_perf.csv");
     }
     
-    // ========================================================================
-    // Export Results
-    // ========================================================================
-    write_results_csv(results, "benchmark_results.csv");
+    write_results_csv(results, "benchmark_results_with_perf.csv");
     
-    std::cout << "\n================================================\n";
+    std::cout << "\n========================================================\n";
     std::cout << "Microbenchmark complete!\n";
+    std::cout << "Results with perf counters: benchmark_results_with_perf.csv\n";
     std::cout << "Run visualization: python3 plot.py\n";
-    std::cout << "================================================\n";
+    std::cout << "========================================================\n";
     
     return 0;
 }
